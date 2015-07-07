@@ -1,0 +1,6 @@
+PKG profuse.linux
+PKG profuse.cli
+
+S cli
+S src
+B _build/**
