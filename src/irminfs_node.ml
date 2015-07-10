@@ -270,7 +270,7 @@ let of_json : T.t Tc.of_json = fun json -> match sort_json_object json with
     }
   | _ -> failwith "Irminfs_node.of_json"
 
-let to_json : T.t Tc.to_json = function
+let to_json_object = function
   | { atime; ctime; ino; kind; mtime; mode; links; uid; gid } ->
     `O [ "atime", `Float (Int64.to_float atime);
          "ctime", `Float (Int64.to_float ctime);
@@ -283,18 +283,28 @@ let to_json : T.t Tc.to_json = function
          "gid",   `Float (Int32.to_float gid);
        ]
 
+let to_json : T.t Tc.to_json = fun t -> Ezjsonm.value (to_json_object t)
+
 let size = function
   | { T.kind = Kind.Symlink path } -> Int64.of_int (String.length path)
 
 let size_of t =
+  String.length (Ezjsonm.to_string (to_json_object t))
+(* ELIDED: packed binary rep
   8 + (* ino *)
   8 + 8 + 8 + (* time * 3 *)
   Kind.size_of t.kind +
   2 + (* mode *)
   Links.size_of t.links +
   4 + 4 (* uid, gid *)
-
+*)
 let write t c =
+  let s = Ezjsonm.to_string (to_json_object t) in
+  Mstruct.(with_mstruct c (fun m ->
+    set_string m s
+  ));
+  Cstruct.shift c (String.length s)
+(* ELIDED: packed binary rep
   let c = Kind.write t.kind c in
   Mstruct.(with_mstruct c (fun m ->
     set_be_uint64 m t.ino;
@@ -307,8 +317,11 @@ let write t c =
   ));
   let c = Cstruct.shift c (8 + 8 + 8 + 8 + 2 + 4 + 4) in
   Links.write t.links c
+*)
 
 let read m =
+  of_json (Ezjsonm.from_string (Mstruct.to_string m))
+(* ELIDED: packed binary rep
   let kind  = Kind.read m in
   let ino   = Mstruct.get_be_uint64 m in
   let atime = Mstruct.get_be_uint64 m in
@@ -319,6 +332,7 @@ let read m =
   let gid   = Mstruct.get_be_uint32 m in
   let links = Links.read m in
   { kind; ino; atime; ctime; mtime; mode; links; uid; gid }
+*)
 
 module Path = Irmin.Path.String_list
 
