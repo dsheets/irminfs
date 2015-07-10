@@ -42,6 +42,7 @@ end
 module N = Nodes.Make(Path)
 
 module Store = Irmin.Basic(Irmin_unix.Irmin_git.FS)(Irminfs_node)
+module View = Irmin.View(Store)
 
 module Trans = Irminfs_trans
 
@@ -190,7 +191,7 @@ struct
     let req_off = Int64.to_int (Ctypes.getf r In.Read.offset) in
     let fh = Ctypes.getf r In.Read.fh in
     H.with_dir_fd st.handles fh (fun h ((dir,off), path) ->
-      let store = st.irmin Trans.readdir in
+      let store = st.irmin (Trans.readdir path) in
       let paths = Lwt_main.run (Store.list store path) in
       let unix_start = List.length paths in
       if req_off < unix_start
@@ -312,7 +313,7 @@ struct
   (* Can raise Unix.Unix_error *)
   let symlink name target req st = Out.(
     let ({ Nodes.data } as pnode) = N.get st.nodes (nodeid req) in
-    let path = Filename.concat (Path.to_string data) name in
+    let path = List.rev (name::data) in
 
     let store = st.irmin Trans.({
       call = Call.Symlink (target, path)
@@ -340,22 +341,56 @@ struct
   (* Can raise Unix.Unix_error *)
   let rename r src dest req st = Out.(
     let { Nodes.data } = N.get st.nodes (nodeid req) in
-    let path = Path.to_string data in
     let newdir = N.get st.nodes (Ctypes.getf r In.Rename.newdir) in
-    let newpath = Path.to_string newdir.Nodes.data in
-    (* errors caught by our caller *)
-    Unix.rename (Filename.concat path src) (Filename.concat newpath dest);
-    (* TODO: still increment lookups? *)
-    respond_with_entry st.irmin (N.lookup newdir dest) req;
+    let spath = List.rev (src::data) in
+    let dpath = List.rev (dest::newdir.Nodes.data) in
+    let store = st.irmin (Trans.rename spath dpath) in
+
+    let module P = Path in
+    Irminfs_node.(T.(match Lwt_main.run (
+      Store.read store spath
+    ) with
+    | None ->
+      let path = P.to_string data in
+      let newpath = P.to_string newdir.Nodes.data in
+      (* errors caught by our caller *)
+      (* TODO: lift and remove with whiteout, don't modify underfs *)
+      Unix.rename (Filename.concat path src) (Filename.concat newpath dest)
+    | Some v -> match Lwt_main.run begin
+      View.of_path store []
+      >>= fun view ->
+      View.update view dpath v
+      >>= fun () ->
+      View.remove view spath
+      >>= fun () ->
+      View.merge_path store [] view
+    end with
+    | `Ok () -> ()
+    | `Conflict _ -> raise Unix.(Unix_error (EBUSY, "rename", ""))
+    ));
+    write_ack req;
     st
   )
 
   (* Can raise Unix.Unix_error *)
   let unlink name req st = Out.(
     let { Nodes.data } = N.get st.nodes (nodeid req) in
-    let path = Filename.concat (Path.to_string data) name in
-    (* errors caught by our caller *)
-    Unix.unlink path;
+    let path = List.rev (name::data) in
+    let store = st.irmin (Trans.unlink path) in
+
+    let module P = Path in
+    Irminfs_node.(T.(Lwt_main.run begin
+      Store.mem store path
+      >>= function
+      | true -> Store.remove store path
+      | false ->
+        (* TODO: remove with whiteout. don't modify underfs *)
+        let path = Filename.concat (P.to_string data) name in
+        (* errors caught by our caller *)
+        try Unix.unlink path; Lwt.return_unit with exn -> Lwt.fail exn
+    end
+    ));
+
     write_ack req;
     st
   )

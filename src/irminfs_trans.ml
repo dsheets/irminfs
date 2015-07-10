@@ -15,23 +15,37 @@
  *
  *)
 
+let split = Stringext.split ~on:'/'
+let concat = String.concat "/"
+
 module Call = struct
   type t =
     | Lookup of string list
-    | Readdir (* TODO: should contain more info but it's not obvious how *)
-    | Symlink of string * string
+    | Readdir of string list
+    | Symlink of string * string list
+    | Rename of string list * string list
+    | Unlink of string list
 
   let of_json = function
-    | `O ["symlink", `A [`String a; `String b]] -> Symlink (a,b)
-    | `O ["lookup", `String path] -> Lookup (Stringext.split ~on:'/' path)
-    | `String "readdir" -> Readdir
+    | `O ["symlink", `A [`String a; `String b]] -> Symlink (a, split b)
+    | `O ["lookup", `String path] -> Lookup (split path)
+    | `O ["readdir", `String path] -> Readdir (split path)
+    | `O ["unlink", `String path] -> Unlink (split path)
+    | `O ["rename", `A [`String src; `String dest]] ->
+      Rename (split src, split dest)
     | _ -> failwith "Irminfs_trans.Call.of_json"
+
   let to_json = function
     | Symlink (a,b) ->
-      `O ["symlink", `A [`String a; `String b]]
+      `O ["symlink", `A [`String a; `String (concat b)]]
     | Lookup path ->
-      `O ["lookup", `String (String.concat "/" path)]
-    | Readdir -> `String "readdir"
+      `O ["lookup", `String (concat path)]
+    | Readdir path ->
+      `O ["readdir", `String (concat path)]
+    | Rename (src, dest) ->
+      `O ["rename", `A [`String (concat src); `String (concat dest)]]
+    | Unlink path ->
+      `O ["unlink", `String (concat path)]
 end
 
 type t = {
@@ -48,4 +62,6 @@ let to_json { call } =
 let task t = Irmin_unix.task (Ezjsonm.to_string (to_json t))
 
 let lookup path = { call = Call.Lookup path }
-let readdir = { call = Call.Readdir }
+let readdir path = { call = Call.Readdir path }
+let rename src dest = { call = Call.Rename (src, dest) }
+let unlink path = { call = Call.Unlink path }
