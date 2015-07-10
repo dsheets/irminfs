@@ -1,1 +1,1 @@
-<*>: package(profuse.cli), package(fd-send-recv), package(unix-sys-stat), package(ctypes.foreign)
+<*>: package(profuse.cli), package(fd-send-recv), package(unix-sys-stat), package(ctypes.foreign), package(irmin.unix)

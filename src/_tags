@@ -1,1 +1,1 @@
-<*.{ml,mli}>: package(unix-sys-stat), package(profuse)
+<*.{ml,mli}>: package(unix-sys-stat), package(profuse), package(lwt), package(irmin)

@@ -1,3 +1,5 @@
+PKG irmin
+PKG profuse
 PKG profuse.linux
 PKG profuse.cli
 
