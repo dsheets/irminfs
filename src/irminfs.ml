@@ -41,7 +41,7 @@ end
 
 module N = Nodes.Make(Path)
 
-module Store = Irmin.Basic(Irmin_unix.Irmin_git.FS)(Irminfs_node)
+module Store = Irmin.Basic(Irmin_unix.Irmin_http.Make)(Irminfs_node)
 module View = Irmin.View(Store)
 
 module Trans = Irminfs_trans
@@ -62,14 +62,14 @@ let string_of_nodeid nodeid st = N.string_of_id st.nodes nodeid
 let uint64_of_int64 = Unsigned.UInt64.of_int64
 let uint32_of_uint64 x = Unsigned.(UInt32.of_int (UInt64.to_int x))
 
-let irmin_config = Irmin_git.config ~root:"db" ~bare:true ()
-
-let make () = {
-  nodes = N.create [];
-  handles = H.create ();
-  agents = Agent_handler.create ();
-  irmin = Lwt_main.run (Store.create irmin_config Trans.task);
-}
+let make uri =
+  let irmin_config = Irmin_http.config uri in
+  {
+    nodes = N.create [];
+    handles = H.create ();
+    agents = Agent_handler.create ();
+    irmin = Lwt_main.run (Store.create irmin_config Trans.task);
+  }
 
 module Linux_7_8(In : In.LINUX_7_8)(Out : Out.LINUX_7_8)
   : Profuse.FULL with type t = state and module In = In =

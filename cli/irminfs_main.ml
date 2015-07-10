@@ -17,6 +17,21 @@
 
 module Cli = Fuse_cli.Make(Profuse.Server(In.Linux_7_8)(Out.Linux_7_8)(Irminfs))
 
+module Store = Irmin.Basic(Irmin_unix.Irmin_git.FS)(Irminfs_node)
+module IrminServer = Irmin_unix.Irmin_http_server.Make(Store)
 ;;
 
-Cli.run (Irminfs.make ())
+let server_uri = Uri.of_string "http://localhost:27182" in
+match Lwt_unix.fork () with
+| 0 -> Lwt_main.run begin
+  let open Lwt.Infix in
+  let config = Irmin_unix.Irmin_git.config ~root:"irminfs_db" () in
+  Store.create config Irmin_unix.task
+  >>= fun irmin ->
+  IrminServer.listen (irmin "BANG") server_uri
+end
+| child_pid ->
+  at_exit (fun () ->
+    Unix.kill child_pid Sys.sigint
+  );
+  Cli.run (Irminfs.make server_uri)
