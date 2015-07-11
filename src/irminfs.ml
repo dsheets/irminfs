@@ -409,8 +409,29 @@ struct
     st
   )
 
-  (* TODO: do *)
-  let statfs = enosys
+  (* TODO: don't lie *)
+  let statfs req st =
+    let module Statfs = Struct_common.Kstatfs in
+    let one_gb = 1 lsl 30 in
+    let bsize = 512 in
+    let blocks = uint64_of_int64 (Int64.of_int (one_gb / bsize)) in
+    let write req =
+      let pkt = Out_common.Hdr.make req Statfs.t in
+      Statfs.store
+        ~blocks
+        ~bfree:blocks
+        ~bavail:blocks
+        ~files:blocks
+        ~ffree:blocks
+        ~bsize:(Unsigned.UInt32.of_int bsize)
+        ~namelen:(Unsigned.UInt32.of_int 255)
+        ~frsize:(Unsigned.UInt32.of_int bsize)
+        pkt;
+      Ctypes.(CArray.from_ptr
+                (coerce (ptr Statfs.t) (ptr char) (addr pkt)) (sizeof Statfs.t))
+    in
+    Out.write_reply req write;
+    st
 
   (* TODO: do *)
   let fsync _f = enosys
