@@ -46,6 +46,14 @@ module View = Irmin.View(Store)
 
 module Trans = Irminfs_trans
 
+module Space = struct
+  let list_nodes store path =
+    View.of_path store path
+    >>= fun view ->
+    View.list view []
+    >>= Lwt_list.filter_p (View.mem view)
+end
+
 type state = {
   nodes   : N.t;
   handles : H.t;
@@ -192,7 +200,7 @@ struct
     let fh = Ctypes.getf r In.Read.fh in
     H.with_dir_fd st.handles fh (fun h ((dir,off), path) ->
       let store = st.irmin (Trans.readdir path) in
-      let paths = Lwt_main.run (Store.list store path) in
+      let paths = Lwt_main.run (Space.list_nodes store path) in
       let unix_start = List.length paths in
       if req_off < unix_start
       then
@@ -318,12 +326,11 @@ struct
     let store = st.irmin Trans.({
       call = Call.Symlink (target, path)
     }) in
-    let key = Stringext.split ~on:'/' name in
     let uid = In.(Ctypes.getf req.Fuse.hdr Hdr.uid) in
     let gid = In.(Ctypes.getf req.Fuse.hdr Hdr.gid) in
     let host = Fuse.(req.chan.host.unix_sys_stat.Unix_sys_stat.mode) in
     Lwt_main.run (
-      Store.update store key Irminfs_node.(T.({
+      Store.update store path Irminfs_node.(T.({
         ino = Int64.of_int (Irminfs_node.next_ino ());
         mode = Stat.Mode.to_code ~host (Unix.S_LNK, 0o777);
         uid; gid;
@@ -399,14 +406,19 @@ struct
   let rmdir name req st = Out.(
     let { agents } = st in
     let { Nodes.data } = N.get st.nodes (nodeid req) in
-    let path = Path.to_string data in
-    let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
-    let gid = Ctypes.getf req.Fuse.hdr In.Hdr.gid in
-    let path = Filename.concat path name in
-    (* errors caught by our caller *)
-    agents.Agent_handler.rmdir ~uid ~gid path;
-    write_ack req;
-    st
+    let path = List.rev (name::data) in
+    let store = st.irmin (Trans.rmdir path) in
+    match Lwt_main.run (Space.list_nodes store path) with
+    | [] ->
+      let path = Path.to_string data in
+      let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
+      let gid = Ctypes.getf req.Fuse.hdr In.Hdr.gid in
+      let path = Filename.concat path name in
+      (* errors caught by our caller *)
+      agents.Agent_handler.rmdir ~uid ~gid path;
+      write_ack req;
+      st
+    | _::_ -> raise Unix.(Unix_error (ENOTEMPTY,"rmdir",name))
   )
 
   (* TODO: don't lie *)
