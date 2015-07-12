@@ -15,8 +15,14 @@
  *
  *)
 
-module Path = Irminfs_path
 
-include Tc.Cstruct
+let size_of_json f t = String.length (Ezjsonm.to_string (f t))
 
-let merge _path = Irmin.Merge.(option (module Tc.Cstruct) (default Tc.cstruct))
+let write_json f t c =
+  let s = Ezjsonm.to_string (f t) in
+  Mstruct.(with_mstruct c (fun m ->
+    set_string m s
+  ));
+  Cstruct.shift c (String.length s)
+
+let read_json f m = f (Ezjsonm.from_string (Mstruct.to_string m))

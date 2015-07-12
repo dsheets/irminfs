@@ -32,27 +32,23 @@ end
 
 module H = Handles.Make(Dir)(Handles.Unix_file)
 
-module Path = struct
+module FSPath = struct
   include Nodes.Path
   let to_string = function
     | [] -> "."
     | p  -> to_string p
 end
 
-module N = Nodes.Make(Path)
+module N = Nodes.Make(FSPath)
 
-module Store = Irmin.Basic(Irmin_unix.Irmin_http.Make)(Irminfs_node)
-module View = Irmin.View(Store)
-
+module Path  = Irminfs_path
+module Ino   = Irminfs_ino
+module Node  = Irminfs_node
+module Bundle= Irminfs_bundle
+module Store = Irmin.Basic(Irmin_unix.Irmin_http.Make)(Node)
+module Space = Irminfs_space.Make(Store)
+module View  = Space.View
 module Trans = Irminfs_trans
-
-module Space = struct
-  let list_nodes store path =
-    View.of_path store path
-    >>= fun view ->
-    View.list view []
-    >>= Lwt_list.filter_p (View.mem view)
-end
 
 type state = {
   nodes   : N.t;
@@ -100,15 +96,18 @@ struct
   let store_attr_of_path taskf path = Stat.(Stat.(
     let plist = List.rev path in
     let store = taskf (Trans.lookup plist) in
-    match Lwt_main.run (Store.read store plist) with
-    | Some ({ Irminfs_node.T.ino;
+    match Lwt_main.run Space.(read Ino store plist) with
+    | Some ({ Ino.T.ino;
               atime; mtime; ctime;
               mode; links;
               uid; gid;
             } as node) ->
+      let nlink =
+        Unsigned.UInt32.of_int (1 + Ino.PathSet.cardinal links)
+      in
       Struct.Linux_7_8.Attr.store
         ~ino
-        ~size:(Irminfs_node.size node)
+        ~size:(Space.size store plist node)
         ~blocks:0_L (* TODO: check *)
         ~atime:(uint64_of_int64 atime)
         ~atimensec:(Unsigned.UInt32.of_int 0)
@@ -117,12 +116,12 @@ struct
         ~ctime:(uint64_of_int64 ctime)
         ~ctimensec:(Unsigned.UInt32.of_int 0)
         ~mode:(Int32.of_int mode)
-        ~nlink:(Unsigned.UInt32.of_int (1 + Irminfs_node.PathSet.cardinal links))
+        ~nlink
         ~uid
         ~gid
         ~rdev:(Unsigned.UInt32.of_int32 0_l) (* TODO: assumes regular file *)
     | None ->
-      let s = lstat (Path.to_string path) in
+      let s = lstat (FSPath.to_string path) in
       Struct.Linux_7_8.Attr.store
         ~ino:(Unsigned.UInt64.to_int64 (ino_int s))
         ~size:(size_int s)
@@ -158,7 +157,7 @@ struct
     try
       let { nodes } = st in
       let { Nodes.data } = N.get nodes (nodeid req) in
-      let path = Path.to_string data in
+      let path = FSPath.to_string data in
       let dir = Unix.opendir path in
       let h = H.(alloc st.handles (Handles.Dir ((dir, 0),List.rev data))) in
       write_reply req (Open.create ~fh:h.Handles.id ~open_flags:0l);
@@ -209,7 +208,7 @@ struct
           | n -> seek (List.tl list) (n - 1)
         in
         let paths = seek paths req_off in
-        let name = List.hd (List.hd paths) in
+        let name = Path.hd (List.hd paths) in
         print_endline ("readdir return "^name);
         let off = req_off + 1 in
         Dir.set_dir_offset h off;
@@ -249,18 +248,17 @@ struct
     let path = List.rev node.Nodes.data in
 
     let store = st.irmin (Trans.lookup path) in
-    let module P = Path in
-    let target = Irminfs_node.(T.(match Lwt_main.run (
-      Store.read store path
+    let target = Node.(Ino.(T.(match Lwt_main.run (
+      Space.(read Ino store path)
     ) with
-    | Some { kind = Kind.Symlink target } -> target
+    | Some ({ kind = Kind.Symlink target }) -> target
     | Some _ ->
-      let path = P.to_string node.Nodes.data in
+      let path = FSPath.to_string node.Nodes.data in
       raise Unix.(Unix_error (EINVAL, "readlink", path))
     | None ->
-      let path = P.to_string node.Nodes.data in
+      let path = FSPath.to_string node.Nodes.data in
       Unix.readlink path
-    ))
+    )))
     in
 
     Out.(write_reply req (Readlink.create ~target));
@@ -270,7 +268,7 @@ struct
     try
       let { nodes; handles; agents } = st in
       let { Nodes.data } = N.get nodes (nodeid req) in
-      let path = Path.to_string data in
+      let path = FSPath.to_string data in
       let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
       let gid = Ctypes.getf req.Fuse.hdr In.Hdr.gid in
       let mode = Ctypes.getf op In.Open.mode in (* TODO: is only file_perm? *)
@@ -330,8 +328,9 @@ struct
     let gid = In.(Ctypes.getf req.Fuse.hdr Hdr.gid) in
     let host = Fuse.(req.chan.host.unix_sys_stat.Unix_sys_stat.mode) in
     Lwt_main.run (
-      Store.update store path Irminfs_node.(T.({
-        ino = Int64.of_int (Irminfs_node.next_ino ());
+      (* TODO: check existence *)
+      Space.(create store path Ino.(T.({ Bundle.ino={
+        ino = Int64.of_int (Ino.next_ino ());
         mode = Stat.Mode.to_code ~host (Unix.S_LNK, 0o777);
         uid; gid;
         atime = 0_L; (* TODO: FIXME *)
@@ -339,7 +338,12 @@ struct
         ctime = 0_L; (* TODO: FIXME *)
         links = PathSet.empty;
         kind = Kind.Symlink target;
-      }))
+      };
+        dat = None;
+      })))
+      >>= function
+      | true -> Lwt.return_unit
+      | false -> Lwt.fail Unix.(Unix_error (EEXIST, "symlink", ""))
     );
 
     lookup name req st (* TODO: still increment lookups? *)
@@ -353,28 +357,34 @@ struct
     let dpath = List.rev (dest::newdir.Nodes.data) in
     let store = st.irmin (Trans.rename spath dpath) in
 
-    let module P = Path in
-    Irminfs_node.(T.(match Lwt_main.run (
-      Store.read store spath
-    ) with
-    | None ->
-      let path = P.to_string data in
-      let newpath = P.to_string newdir.Nodes.data in
-      (* errors caught by our caller *)
-      (* TODO: lift and remove with whiteout, don't modify underfs *)
-      Unix.rename (Filename.concat path src) (Filename.concat newpath dest)
-    | Some v -> match Lwt_main.run begin
-      View.of_path store []
-      >>= fun view ->
-      View.update view dpath v
-      >>= fun () ->
-      View.remove view spath
-      >>= fun () ->
-      View.merge_path store [] view
-    end with
-    | `Ok () -> ()
-    | `Conflict _ -> raise Unix.(Unix_error (EBUSY, "rename", ""))
-    ));
+    Lwt_main.run begin
+      View.of_path store Path.empty
+      >>= fun root ->
+      Space.bundle root spath
+      >>= function
+      | None ->
+        let path = FSPath.to_string data in
+        let newpath = FSPath.to_string newdir.Nodes.data in
+        (* errors caught by our caller *)
+        (* TODO: lift and remove with whiteout, don't modify underfs *)
+        Lwt_unix.rename (Filename.concat path src) (Filename.concat newpath dest)
+      | Some { Bundle.ino; dat } ->
+        begin
+          View.update Space.Ino root dpath ino
+          >>= fun () ->
+          View.remove root (Path.ino spath)
+          >>= fun () -> match dat with
+          | None -> View.merge_path store Path.empty root
+          | Some dat ->
+            View.update Space.Dat root dpath dat
+            >>= fun () ->
+            View.remove root (Path.dat spath)
+            >>= fun () ->
+            View.merge_path store Path.empty root
+        end >|= function
+        | `Ok () -> ()
+        | `Conflict _ -> raise Unix.(Unix_error (EBUSY, "rename", ""))
+    end;
     write_ack req;
     st
   )
@@ -385,18 +395,16 @@ struct
     let path = List.rev (name::data) in
     let store = st.irmin (Trans.unlink path) in
 
-    let module P = Path in
-    Irminfs_node.(T.(Lwt_main.run begin
-      Store.mem store path
+    Lwt_main.run begin
+      Space.delete store path
       >>= function
-      | true -> Store.remove store path
+      | true -> Lwt.return_unit
       | false ->
         (* TODO: remove with whiteout. don't modify underfs *)
-        let path = Filename.concat (P.to_string data) name in
+        let path = Filename.concat (FSPath.to_string data) name in
         (* errors caught by our caller *)
-        try Unix.unlink path; Lwt.return_unit with exn -> Lwt.fail exn
-    end
-    ));
+        Lwt_unix.unlink path
+    end;
 
     write_ack req;
     st
@@ -410,7 +418,7 @@ struct
     let store = st.irmin (Trans.rmdir path) in
     match Lwt_main.run (Space.list_nodes store path) with
     | [] ->
-      let path = Path.to_string data in
+      let path = FSPath.to_string data in
       let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
       let gid = Ctypes.getf req.Fuse.hdr In.Hdr.gid in
       let path = Filename.concat path name in
@@ -465,9 +473,9 @@ struct
   (* Can raise Unix.Unix_error *)
   let link l name req st =
     let { Nodes.data } = N.get st.nodes (nodeid req) in
-    let path = Filename.concat (Path.to_string data) name in
+    let path = Filename.concat (FSPath.to_string data) name in
     let oldnode = N.get st.nodes (Ctypes.getf l In.Link.oldnodeid) in
-    let oldpath = Path.to_string oldnode.Nodes.data in
+    let oldpath = FSPath.to_string oldnode.Nodes.data in
     (* errors caught by our caller *)
     Unix.link oldpath path;
     lookup name req st (* TODO: still increment lookups? *)
@@ -487,7 +495,7 @@ struct
   let access a req st =
     let { agents } = st in
     let { Nodes.data } = N.get st.nodes (nodeid req) in
-    let path = Path.to_string data in
+    let path = FSPath.to_string data in
     let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
     let gid = Ctypes.getf req.Fuse.hdr In.Hdr.gid in
     let code = Ctypes.getf a In.Access.mask in
@@ -501,7 +509,7 @@ struct
     try
       let { nodes; handles } = st in
       let ({ Nodes.data } as pnode) = N.get nodes (nodeid req) in
-      let path = Path.to_string data in
+      let path = FSPath.to_string data in
       let mode = Ctypes.getf c In.Create.mode in (* TODO: is only file_perm? *)
       let flags = Ctypes.getf c In.Create.flags in
       let phost = Fuse.(req.chan.host.unix_fcntl.Unix_fcntl.oflags) in
@@ -528,7 +536,7 @@ struct
   let mknod m name req st =
     let { agents } = st in
     let ({ Nodes.data } as pnode) = N.get st.nodes (nodeid req) in
-    let path = Path.to_string data in
+    let path = FSPath.to_string data in
     let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
     let gid = Ctypes.getf req.Fuse.hdr In.Hdr.gid in
     let path = Filename.concat path name in
@@ -546,7 +554,7 @@ struct
   let mkdir m name req st =
     let { agents } = st in
     let ({ Nodes.data } as pnode) = N.get st.nodes (nodeid req) in
-    let path = Path.to_string data in
+    let path = FSPath.to_string data in
     let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
     let gid = Ctypes.getf req.Fuse.hdr In.Hdr.gid in
     let path = Filename.concat path name in
@@ -605,7 +613,7 @@ struct
       )
       else
         let { Nodes.data } = N.get st.nodes (nodeid req) in
-        let path = Path.to_string data in
+        let path = FSPath.to_string data in
         (if Valid.(is_set valid mode)
          then
             let mode = Ctypes.getf s mode in

@@ -15,8 +15,9 @@
  *
  *)
 
-module Path = Irminfs_path
+module Ino = Irminfs_ino
 
-include Tc.Cstruct
-
-let merge _path = Irmin.Merge.(option (module Tc.Cstruct) (default Tc.cstruct))
+type t = {
+  ino : Ino.t;
+  dat : Cstruct.t option;
+}
