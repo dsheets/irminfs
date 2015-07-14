@@ -219,7 +219,6 @@ struct
         in
         let paths = seek paths req_off in
         let name = Path.hd (List.hd paths) in
-        print_endline ("readdir return "^name);
         let off = req_off + 1 in
         Dir.set_dir_offset h off;
         (* TODO: optimize, fix inode *)
