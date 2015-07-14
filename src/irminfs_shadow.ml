@@ -183,10 +183,16 @@ module Make(Store : Space.COORD) = struct
       with Not_found ->
         let { Super.macro } = !super in
         let store = macro.State.position trans in
-        Store.clone task store (Int32.to_string pid)
+        let ic = open_in (Printf.sprintf "/proc/%ld/cmdline" pid) in
+        let cmd = input_line ic in
+        let nidx = String.index cmd '\000' in
+        let cmd = String.sub cmd 0 nidx in
+        close_in ic;
+        let tag = Printf.sprintf "%ld.%s" pid cmd in
+        Store.clone task store tag
         >>= (function
           | `Duplicated_tag -> failwith "Irminfs_shadow.Make(COORD).create"
-          | `Empty_head  -> Store.of_tag config task (Int32.to_string pid)
+          | `Empty_head  -> Store.of_tag config task tag
           | `Ok position -> Lwt.return position
         )
         >>= fun position ->
@@ -226,5 +232,5 @@ module Make(Store : Space.COORD) = struct
       end
       >>= fun state ->
       super := Super.effect paths pid !super;
-      Lwt.return (state.State.position trans)        
+      Lwt.return (state.State.position trans)
 end
