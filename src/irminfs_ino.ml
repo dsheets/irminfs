@@ -252,11 +252,8 @@ module Tc : Tc.S0 with type t = T.t = struct
 
   let hash = Hashtbl.hash
 
-  let sort_json_object = function
-    | `O fields -> `O (List.sort (fun (k, _) (k',_) -> String.compare k k') fields)
-    | json -> json
-
-  let of_json : T.t Tc.of_json = fun json -> match sort_json_object json with
+  let of_json : T.t Tc.of_json = fun json ->
+    match Util.sort_json_object json with
     | `O [ "atime", `Float atime;
            "ctime", `Float ctime;
            "gid",   `Float gid;

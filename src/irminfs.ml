@@ -49,12 +49,13 @@ module Store = Irmin.Basic(Irmin_unix.Irmin_http.Make)(Node)
 module Space = Irminfs_space.Make(Store)
 module View  = Space.View
 module Trans = Irminfs_trans
+module Shadow= Irminfs_shadow.Make(Store)
 
 type state = {
   nodes   : N.t;
   handles : H.t;
   agents  : Agent_handler.t;
-  irmin   : Trans.t -> Store.t;
+  shadow  : Shadow.t;
 }
 type t = state
 
@@ -68,12 +69,15 @@ let uint32_of_uint64 x = Unsigned.(UInt32.of_int (UInt64.to_int x))
 
 let make uri =
   let irmin_config = Irmin_http.config uri in
-  {
-    nodes = N.create [];
-    handles = H.create ();
-    agents = Agent_handler.create ();
-    irmin = Lwt_main.run (Store.create irmin_config Trans.task);
-  }
+  Lwt_main.run (
+    Shadow.create irmin_config Trans.task
+    >|= fun shadow -> {
+      nodes = N.create [];
+      handles = H.create ();
+      agents = Agent_handler.create ();
+      shadow;
+    }
+  )
 
 module Linux_7_8(In : In.LINUX_7_8)(Out : Out.LINUX_7_8)
   : Profuse.FULL with type t = state and module In = In =
@@ -82,6 +86,7 @@ struct
   type t = state
 
   module Support = Profuse.Linux_7_8(In)(Out)
+  module Trans = Trans.Construct(In)
 
   let string_of_state req st =
     Printf.sprintf "Nodes: %s" (N.to_string st.nodes)
@@ -93,9 +98,9 @@ struct
   let enosys = Support.enosys
   let nodeid = Support.nodeid
 
-  let store_attr_of_path taskf path = Stat.(Stat.(
+  let store_attr_of_path req taskf path = Stat.(Stat.(
     let plist = List.rev path in
-    let store = taskf (Trans.lookup plist) in
+    let store = Lwt_main.run (taskf (Trans.lookup req plist)) in
     match Lwt_main.run Space.(read Ino store plist) with
     | Some ({ Ino.T.ino;
               atime; mtime; ctime;
@@ -144,7 +149,7 @@ struct
       let { Nodes.data = path } = N.get st.nodes (nodeid req) in
       write_reply req
         (Attr.create ~attr_valid:0L ~attr_valid_nsec:0l
-           ~store_attr:(store_attr_of_path st.irmin path));
+           ~store_attr:(store_attr_of_path req st.shadow path));
       st
     with Not_found ->
       (* TODO: log? *)
@@ -181,16 +186,18 @@ struct
       st
   )
 
-  let store_entry taskf =
-    Support.store_entry (fun node -> store_attr_of_path taskf node.Nodes.data)
-  let respond_with_entry taskf =
+  let store_entry req taskf =
+    Support.store_entry (fun node ->
+      store_attr_of_path req taskf node.Nodes.data
+    )
+  let respond_with_entry req taskf =
     Support.respond_with_entry (fun node ->
-      store_attr_of_path taskf node.Nodes.data
+      store_attr_of_path req taskf node.Nodes.data
     )
 
   let lookup name req st =
     let parent = N.get st.nodes (nodeid req) in
-    respond_with_entry st.irmin (N.lookup parent name) req;
+    respond_with_entry req st.shadow (N.lookup parent name) req;
     st
 
   let readdir r req st = Out.(
@@ -198,8 +205,11 @@ struct
     let req_off = Int64.to_int (Ctypes.getf r In.Read.offset) in
     let fh = Ctypes.getf r In.Read.fh in
     H.with_dir_fd st.handles fh (fun h ((dir,off), path) ->
-      let store = st.irmin (Trans.readdir path) in
-      let paths = Lwt_main.run (Space.list_nodes store path) in
+      let paths = Lwt_main.run (
+        st.shadow (Trans.readdir req path)
+        >>= fun store ->
+        Space.list_nodes store path
+      ) in
       let unix_start = List.length paths in
       if req_off < unix_start
       then
@@ -247,8 +257,9 @@ struct
     (* errors caught by our caller *)
     let path = List.rev node.Nodes.data in
 
-    let store = st.irmin (Trans.lookup path) in
     let target = Node.(Ino.(T.(match Lwt_main.run (
+      st.shadow (Trans.lookup req path)
+      >>= fun store ->
       Space.(read Ino store path)
     ) with
     | Some ({ kind = Kind.Symlink target }) -> target
@@ -268,7 +279,6 @@ struct
     try
       let { nodes; handles; agents } = st in
       let { Nodes.data } = N.get nodes (nodeid req) in
-      let path = FSPath.to_string data in
       let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
       let gid = Ctypes.getf req.Fuse.hdr In.Hdr.gid in
       let mode = Ctypes.getf op In.Open.mode in (* TODO: is only file_perm? *)
@@ -277,6 +287,8 @@ struct
       let flags = Unix_fcntl.Oflags.(
         List.rev_map to_open_flag_exn (of_code ~host:phost flags)
       ) in
+
+      let path = FSPath.to_string data in
       let file = agents.Agent_handler.open_ ~uid ~gid path flags mode in
       let kind = Unix.((fstat file).st_kind) in
       let h = H.(alloc handles (Handles.File (file, kind))) in
@@ -321,13 +333,12 @@ struct
     let ({ Nodes.data } as pnode) = N.get st.nodes (nodeid req) in
     let path = List.rev (name::data) in
 
-    let store = st.irmin Trans.({
-      call = Call.Symlink (target, path)
-    }) in
     let uid = In.(Ctypes.getf req.Fuse.hdr Hdr.uid) in
     let gid = In.(Ctypes.getf req.Fuse.hdr Hdr.gid) in
     let host = Fuse.(req.chan.host.unix_sys_stat.Unix_sys_stat.mode) in
     Lwt_main.run (
+      st.shadow (Trans.symlink req target path)
+      >>= fun store ->
       (* TODO: check existence *)
       Space.(create store path Ino.(T.({ Bundle.ino={
         ino = Int64.of_int (Ino.next_ino ());
@@ -355,9 +366,10 @@ struct
     let newdir = N.get st.nodes (Ctypes.getf r In.Rename.newdir) in
     let spath = List.rev (src::data) in
     let dpath = List.rev (dest::newdir.Nodes.data) in
-    let store = st.irmin (Trans.rename spath dpath) in
 
     Lwt_main.run begin
+      st.shadow (Trans.rename req spath dpath)
+      >>= fun store ->
       View.of_path store Path.empty
       >>= fun root ->
       Space.bundle root spath
@@ -393,9 +405,10 @@ struct
   let unlink name req st = Out.(
     let { Nodes.data } = N.get st.nodes (nodeid req) in
     let path = List.rev (name::data) in
-    let store = st.irmin (Trans.unlink path) in
 
     Lwt_main.run begin
+      st.shadow (Trans.unlink req path)
+      >>= fun store ->
       Space.delete store path
       >>= function
       | true -> Lwt.return_unit
@@ -415,8 +428,11 @@ struct
     let { agents } = st in
     let { Nodes.data } = N.get st.nodes (nodeid req) in
     let path = List.rev (name::data) in
-    let store = st.irmin (Trans.rmdir path) in
-    match Lwt_main.run (Space.list_nodes store path) with
+    match Lwt_main.run (
+      st.shadow (Trans.rmdir req path)
+      >>= fun store ->
+      Space.list_nodes store path
+    ) with
     | [] ->
       let path = FSPath.to_string data in
       let uid = Ctypes.getf req.Fuse.hdr In.Hdr.uid in
@@ -524,7 +540,7 @@ struct
       let h = H.(alloc handles (Handles.File (file, kind))) in
       write_reply req
         (Create.create
-           ~store_entry:(store_entry st.irmin (N.lookup pnode name))
+           ~store_entry:(store_entry req st.shadow (N.lookup pnode name))
            ~store_open:(Open.store ~fh:h.Handles.id ~open_flags:0l));
       (* TODO: flags *)
       st
@@ -548,7 +564,7 @@ struct
     (* TODO: fifo -> mkfifo for compat? *)
     agents.Agent_handler.mknod ~uid ~gid path mode
       (Unsigned.UInt32.to_int32 rdev);
-    respond_with_entry st.irmin (N.lookup pnode name) req;
+    respond_with_entry req st.shadow (N.lookup pnode name) req;
     st
 
   let mkdir m name req st =
@@ -560,7 +576,7 @@ struct
     let path = Filename.concat path name in
     let mode = Ctypes.getf m In.Mkdir.mode in
     agents.Agent_handler.mkdir ~uid ~gid path mode;
-    respond_with_entry st.irmin (N.lookup pnode name) req;
+    respond_with_entry req st.shadow (N.lookup pnode name) req;
     st
 
   (* TODO: do *)

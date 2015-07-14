@@ -26,3 +26,7 @@ let write_json f t c =
   Cstruct.shift c (String.length s)
 
 let read_json f m = f (Ezjsonm.from_string (Mstruct.to_string m))
+
+let sort_json_object = function
+  | `O fields -> `O (List.sort (fun (k, _) (k',_) -> String.compare k k') fields)
+  | json -> json
