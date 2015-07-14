@@ -23,15 +23,17 @@ module IrminServer = Irmin_unix.Irmin_http_server.Make(Store)
 
 let server_uri = Uri.of_string "http://localhost:27182" in
 match Lwt_unix.fork () with
-| 0 -> Lwt_main.run begin
-  let open Lwt.Infix in
-  let config = Irmin_unix.Irmin_git.config ~root:"irminfs_db" () in
-  Store.create config Irmin_unix.task
-  >>= fun irmin ->
-  IrminServer.listen (irmin "BANG") server_uri
-end
+| 0 ->
+  Sys.(set_signal sigint Signal_ignore);
+  Lwt_main.run begin
+    let open Lwt.Infix in
+    let config = Irmin_unix.Irmin_git.config ~root:"irminfs_db" () in
+    Store.create config Irmin_unix.task
+    >>= fun irmin ->
+    IrminServer.listen (irmin "BANG") server_uri
+  end
 | child_pid ->
   at_exit (fun () ->
-    Unix.kill child_pid Sys.sigint
+    Unix.kill child_pid Sys.sigterm;
   );
   Cli.run (Irminfs.make server_uri)

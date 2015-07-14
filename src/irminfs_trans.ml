@@ -69,6 +69,7 @@ end
 
 module Call = struct
   type t =
+    | Sync
     | Pull of int32 * Kind.t Pathm.t
     | Lookup of string list
     | Readdir of string list
@@ -90,6 +91,7 @@ module Call = struct
         Pathm.add (Path.of_hum path) (Kind.of_json kind) m
       ) Pathm.empty pathm in
       Pull (Int32.of_float remote, paths)
+    | `O ["sync", `Null] -> Sync
     | _ -> failwith "Irminfs_trans.Call.of_json"
 
   let to_json = function
@@ -112,6 +114,7 @@ module Call = struct
           (Path.to_hum p, Kind.to_json k)::l
         ) paths []);
       ]]
+    | Sync -> `O ["sync", `Null]
 
   let with_parents children paths =
     let paths = Pathm.of_list paths in
@@ -135,6 +138,7 @@ module Call = struct
         Path.ino path', Create; Path.dat path', Create;
       ]
     | Pull (_, paths) -> paths
+    | Sync -> Pathm.empty
   )
 end
 
@@ -186,4 +190,5 @@ module Construct(In : In.LINUX_7_8) = struct
   let rename req src dest = with_call req (Call.Rename (src, dest))
   let unlink req path = with_call req (Call.Unlink path)
   let rmdir req path = with_call req (Call.Rmdir path)
+  let sync req = with_call req Call.Sync
 end

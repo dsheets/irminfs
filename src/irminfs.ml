@@ -596,7 +596,16 @@ struct
   (* TODO: do *)
   let bmap _b = enosys
 
-  let destroy _req _st = ()
+  let destroy req st = Lwt_main.run begin
+    Lwt.catch (fun () ->
+      st.shadow (Trans.sync req)
+      >>= fun _store -> Lwt.return_unit
+    ) (fun exn ->
+      print_endline (Printexc.to_string exn);
+      print_endline (Printexc.get_backtrace ());
+      Lwt.return_unit
+    )
+  end
 
   let setattr s req st = In.Setattr.(
     let valid = Ctypes.getf s valid in

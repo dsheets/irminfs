@@ -77,6 +77,18 @@ module Make(Store : Space.COORD) = struct
       ) paths Particlem.empty in
       Particlem.fold (fun p paths l -> (p,paths)::l) particles []
 
+    let sync t =
+      let particles = Observe.fold (fun path observation map ->
+        Particles.fold (fun particle map ->
+          let paths =
+            try Particlem.find particle map
+            with Not_found -> Pathm.empty
+          in
+          Particlem.add particle (Pathm.add path observation.kind paths) map
+        ) observation.particles map
+      ) t.observe Particlem.empty in
+      Particlem.fold (fun p paths l -> (p,paths)::l) particles []
+
     let actions pid t =
       try Particlem.find pid t.effects
       with Not_found -> Pathm.empty
@@ -135,42 +147,33 @@ module Make(Store : Space.COORD) = struct
 
   module Super = struct
     module System = Map.Make(Int32)
-    type t = {
-      system : State.t System.t;
-      macro  : State.t;
-    }
+    type t = State.t System.t
 
     let create position =
       position
       >|= fun position ->
-      {
-        system = System.empty;
-        macro = State.empty position;
-      }
+      System.singleton 0_l (State.empty position)
 
-    let find pid { system } = System.find pid system
+    let find pid system = System.find pid system
 
-    let add pid state super =
-      { super with system = System.add pid state super.system }
+    let add pid state system = System.add pid state system
 
-    let effect paths pid { macro; system } =
-      let macro = State.observe paths pid macro in
-      let system = System.mapi (fun p state ->
+    let effect paths pid system =
+      System.mapi (fun p state ->
         if p = pid
         then State.write paths state
         else State.observe paths pid state
-      ) system in
-      { macro; system }
+      ) system
 
-    let collapse particles pid super =
-      let state = find pid super in
+    let collapse particles pid system =
+      let state = find pid system in
       let (system, waves) = List.fold_left (fun (system,map) p ->
-        let particle = find p super in
+        let particle = find p system in
         (System.add p (State.merge pid particle) system,
          Particlem.add p (State.actions pid particle) map)
-      ) (super.system,Particlem.empty) particles in
+      ) (system,Particlem.empty) particles in
       let state = State.interfere waves state in
-      add pid state { super with system }, state
+      add pid state system, state
   end
 
   let create config task =
@@ -181,7 +184,7 @@ module Make(Store : Space.COORD) = struct
     let get_state pid trans =
       try Lwt.return (Super.find pid !super)
       with Not_found ->
-        let { Super.macro } = !super in
+        let macro = Super.find 0_l !super in
         let store = macro.State.position trans in
         let ic = open_in (Printf.sprintf "/proc/%ld/cmdline" pid) in
         let cmd = input_line ic in
@@ -191,7 +194,7 @@ module Make(Store : Space.COORD) = struct
         let tag = Printf.sprintf "%ld.%s" pid cmd in
         Store.clone task store tag
         >>= (function
-          | `Duplicated_tag -> failwith "Irminfs_shadow.Make(COORD).create"
+          | `Duplicated_tag
           | `Empty_head  -> Store.of_tag config task tag
           | `Ok position -> Lwt.return position
         )
@@ -206,17 +209,21 @@ module Make(Store : Space.COORD) = struct
       let paths = Trans.paths trans in
       get_state pid trans
       >>= fun state ->
-      begin match State.observations paths state with
-        | [] -> Lwt.return state
-        | observations ->
-          let forces = List.filter (fun (pid, opaths) ->
+      let forces = match trans with
+        | { Trans.call = Trans.Call.Sync } -> State.sync state
+        | _ ->
+          List.filter (fun (pid, opaths) ->
             Pathm.exists Kind.(fun path -> function
               | Create | Read | Update | Delete -> Pathm.mem path opaths
               | Set ->
                 try Pathm.find path opaths <> Set
                 with Not_found -> false
             ) paths
-          ) observations in
+          ) (State.observations paths state)
+      in
+      begin match forces with
+        | [] -> Lwt.return state
+        | forces ->
           let particles = List.map fst forces in
           let (super', state) = Super.collapse particles pid !super in
           super := super';
