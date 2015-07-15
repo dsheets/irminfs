@@ -63,7 +63,7 @@ module Make(Store : Space.COORD) = struct
       ) j k
 
     let observations paths t =
-      let particles = Pathm.fold (fun path _kind map ->
+      Pathm.fold (fun path _kind map ->
         try
           let { particles; kind } = Observe.find path t.observe in
           Particles.fold (fun particle map ->
@@ -74,11 +74,10 @@ module Make(Store : Space.COORD) = struct
             Particlem.add particle (Pathm.add path kind paths) map
           ) particles map
         with Not_found -> map
-      ) paths Particlem.empty in
-      Particlem.fold (fun p paths l -> (p,paths)::l) particles []
+      ) paths Particlem.empty
 
     let sync t =
-      let particles = Observe.fold (fun path observation map ->
+      Observe.fold (fun path observation map ->
         Particles.fold (fun particle map ->
           let paths =
             try Particlem.find particle map
@@ -86,8 +85,7 @@ module Make(Store : Space.COORD) = struct
           in
           Particlem.add particle (Pathm.add path observation.kind paths) map
         ) observation.particles map
-      ) t.observe Particlem.empty in
-      Particlem.fold (fun p paths l -> (p,paths)::l) particles []
+      ) t.observe Particlem.empty
 
     let actions pid t =
       try Particlem.find pid t.effects
@@ -167,14 +165,20 @@ module Make(Store : Space.COORD) = struct
 
     let collapse particles pid system =
       let state = find pid system in
-      let (system, waves) = List.fold_left (fun (system,map) p ->
+      let (system, waves) = Particles.fold (fun p (system,map) ->
         let particle = find p system in
         (System.add p (State.merge pid particle) system,
          Particlem.add p (State.actions pid particle) map)
-      ) (system,Particlem.empty) particles in
+      ) particles (system,Particlem.empty) in
       let state = State.interfere waves state in
       add pid state system, state
   end
+
+  let get_head store config task =
+    Store.head store
+    >>= function
+      | None -> Store.empty config task
+      | Some head -> Store.of_head config task head
 
   let create config task =
     Super.create (Store.create config task)
@@ -212,7 +216,7 @@ module Make(Store : Space.COORD) = struct
       let forces = match trans with
         | { Trans.call = Trans.Call.Sync } -> State.sync state
         | _ ->
-          List.filter (fun (pid, opaths) ->
+          Particlem.filter (fun pid opaths ->
             Pathm.exists Kind.(fun path -> function
               | Create | Read | Update | Delete -> Pathm.mem path opaths
               | Set ->
@@ -221,21 +225,41 @@ module Make(Store : Space.COORD) = struct
             ) paths
           ) (State.observations paths state)
       in
-      begin match forces with
-        | [] -> Lwt.return state
-        | forces ->
-          let particles = List.map fst forces in
+
+      begin if Particlem.is_empty forces
+        then Lwt.return state
+        else
+          let particles = Particlem.fold (fun p _ ->
+            Particles.add p
+          ) forces Particles.empty in
           let (super', state) = Super.collapse particles pid !super in
           super := super';
-          Lwt_list.iter_s (fun (particle,paths) ->
-            let pull = Trans.pull trans particle paths in
+          let pull = Trans.pull trans forces in
+          let store = state.State.position pull in
+
+          get_head store config task
+          >>= fun shead ->
+          Particles.fold (fun particle prev ->
+            prev >>= fun parents ->
             get_state particle pull
             >>= fun incoming ->
-            State.(Store.merge pull incoming.position ~into:state.position)
+            get_head (incoming.State.position pull) config task
+            >>= fun ihead ->
+            Store.merge pull ihead ~into:shead
             >>= function
             | `Conflict c -> Lwt.fail (Failure ("Pull failure: "^c))
-            | `Ok () -> Lwt.return_unit
-          ) forces >|= fun () -> state
+            | `Ok () ->
+              Store.head_exn (ihead pull)
+              >|= fun head -> head::parents
+          ) particles (Lwt.return [])
+          >>= fun parents ->
+          Space.View.of_path (shead pull) Store.Key.empty
+          >>= fun view ->
+          Space.View.make_head store (task pull) ~parents ~contents:view
+          >>= fun head ->
+          Store.update_head store head
+          >|= fun () ->
+          state
       end
       >>= fun state ->
       super := Super.effect paths pid !super;

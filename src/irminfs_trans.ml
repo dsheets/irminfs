@@ -22,6 +22,7 @@ module Pathm = struct
 
   let of_list pairs = List.fold_left (fun m (k,v) -> add k v m) empty pairs
 end
+module Particlem = Map.Make(Int32)
 
 let split = Stringext.split ~on:'/'
 let concat = String.concat "/"
@@ -70,7 +71,7 @@ end
 module Call = struct
   type t =
     | Sync
-    | Pull of int32 * Kind.t Pathm.t
+    | Pull of Kind.t Pathm.t Particlem.t
     | Lookup of string list
     | Readdir of string list
     | Symlink of string * string list
@@ -90,7 +91,7 @@ module Call = struct
       let paths = List.fold_left (fun m (path, kind) ->
         Pathm.add (Path.of_hum path) (Kind.of_json kind) m
       ) Pathm.empty pathm in
-      Pull (Int32.of_float remote, paths)
+      Pull (Particlem.singleton remote paths)
     | `O ["sync", `Null] -> Sync
     | _ -> failwith "Irminfs_trans.Call.of_json"
 
@@ -107,13 +108,14 @@ module Call = struct
       `O ["unlink", `String (concat path)]
     | Rmdir path ->
       `O ["rmdir", `String (concat path)]
-    | Pull (pid, paths) ->
-      `O ["pull", `A [
-        `Float (Int32.to_float pid);
-        `O (Pathm.fold (fun p k l ->
-          (Path.to_hum p, Kind.to_json k)::l
-        ) paths []);
-      ]]
+    | Pull particles ->
+      let particles = Particlem.fold (fun pid paths list ->
+        (Int32.to_string pid,
+         `O (Pathm.fold (fun p k l ->
+           (Path.to_hum p, Kind.to_json k)::l
+         ) paths []))::list
+      ) particles [] in
+      `O ["pull", `O particles]
     | Sync -> `O ["sync", `Null]
 
   let with_parents children paths =
@@ -122,6 +124,14 @@ module Call = struct
       | None -> m
       | Some parent -> Pathm.add parent k m
     ) paths children
+
+  (* TODO: duplicated from shadow :-( *)
+  let max_effects j k =
+    Pathm.merge (fun _path a b -> match a, b with
+      | None, None -> None
+      | Some x, None | None, Some x -> Some x
+      | Some x, Some y -> Some (Kind.max x y)
+    ) j k
 
   let paths = Kind.(function
     | Readdir path -> Pathm.of_list [ Path.dir path, Read ]
@@ -137,8 +147,9 @@ module Call = struct
         Path.ino path,  Delete; Path.dat path,  Delete;
         Path.ino path', Create; Path.dat path', Create;
       ]
-    | Pull (_, paths) -> paths
-    | Sync -> Pathm.empty
+    | Pull particles ->
+      Particlem.fold (fun _ -> max_effects) particles Pathm.empty
+    | Sync -> Pathm.empty (* TODO: means "all"?!! *)
   )
 end
 
@@ -173,8 +184,8 @@ let task t = Irmin_unix.task (Ezjsonm.to_string (to_json t))
 
 let paths { call } = Call.paths call
 
-let pull { gid; pid; uid } owner paths =
-  { call = Call.Pull (owner, paths); gid; pid; uid }
+let pull { gid; pid; uid } particles =
+  { call = Call.Pull particles; gid; pid; uid }
 
 module Construct(In : In.LINUX_7_8) = struct
 
