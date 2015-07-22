@@ -21,7 +21,7 @@ module Store = Irmin.Basic(Irmin_unix.Irmin_git.FS)(Irminfs_node)
 module IrminServer = Irmin_unix.Irmin_http_server.Make(Store)
 ;;
 
-let server_uri = Uri.of_string "http://localhost:27182" in
+let server_uri = Uri.of_string "http://127.0.0.1:27182" in
 match Lwt_unix.fork () with
 | 0 ->
   Sys.(set_signal sigint Signal_ignore);
