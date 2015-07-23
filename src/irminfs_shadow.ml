@@ -189,7 +189,7 @@ module Make(Store : Space.COORD) = struct
         let ic = open_in (Printf.sprintf "/proc/%ld/cmdline" pid) in
         let cmd = input_line ic in
         let nidx = String.index cmd '\000' in
-        let cmd = String.sub cmd 0 nidx in
+        let cmd = Filename.basename (String.sub cmd 0 nidx) in
         close_in ic;
         let tag = Printf.sprintf "%ld.%s" pid cmd in
         Store.clone task store tag
